@@ -13,7 +13,7 @@ services:
       - "3001:3001"
     environment:
       MONGO_URL: mongodb://mongodb
-      SITE_URL: http://127.0.0.1
+      SITE_URL: ${SITE_URL}
     depends_on:
       - mongodb
   listener:
@@ -22,14 +22,14 @@ services:
       dockerfile: listener.Dockerfile
     environment:
       MONGO_URL: mongodb://mongodb
-      SITE_URL: http://127.0.0.1
+      SITE_URL: ${SITE_URL}
     depends_on:
       - mongodb
   web:
     build:
       context: site
       args:
-        NEXT_PUBLIC_API_BASE: http://127.0.0.1:3001
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE}
     ports:
       - "3000:3000"
     depends_on:
