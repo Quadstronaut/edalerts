@@ -1,4 +1,3 @@
-const request = require('request-promise')
 const Alert = require('../schema/Alert')
 const commodities = require('../commodities.json')
 const rareCommodities = require('../rarecommodities.json')
@@ -20,20 +19,8 @@ module.exports = {
       (req.body.webhook.startsWith('https://discordapp.com/api/webhooks/') ||
         req.body.webhook.startsWith('https://discord.com/api/webhooks/')) &&
       req.body.freq
-      // && req.body.token
     ) {
       try {
-        // let recaptcha = await request({
-        //   uri: 'https://www.google.com/recaptcha/api/siteverify',
-        //   method: 'post',
-        //   form: {
-        //     secret: 'RECAPTCHA_SECRET',
-        //     response: req.body.token,
-        //   },
-        // })
-        // recaptcha = JSON.parse(recaptcha)
-
-        // if (recaptcha.success && recaptcha.score > 0.5) {
         const newAlert = new Alert({
           ...req.body,
           lastSent: 0,
@@ -65,19 +52,23 @@ module.exports = {
 
 Click here to delete: ${process.env.SITE_URL}/delete/${newAlert._id}`
 
-        await request({
-          uri: req.body.webhook,
-          method: 'post',
-          json: {
+        const webhookRes = await fetch(req.body.webhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(5000),
+          body: JSON.stringify({
             username: 'ED Alerts',
             avatar_url: `${process.env.SITE_URL}/favicon.png`,
             content: message,
-          },
+          }),
         })
+
+        if (!webhookRes.ok) {
+          const body = await webhookRes.json().catch(() => ({}))
+          throw new Error(body?.message || `Webhook returned ${webhookRes.status}`)
+        }
+
         res.send(newAlert._id)
-        // } else {
-        //   res.status(401).send('reCAPTCHA failed')
-        // }
       } catch (err) {
         res.status(500).send(err.message)
       }
