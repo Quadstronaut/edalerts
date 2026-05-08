@@ -1,0 +1,10 @@
+**/node_modules
+**/.next
+data
+*.log
+.git
+.gitignore
+docker-compose.yml
+api/api.Dockerfile
+api/listener.Dockerfile
+site/Dockerfile

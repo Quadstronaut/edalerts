@@ -1,6 +1,5 @@
 const zlib = require('zlib')
-const zmq = require('zeromq')
-const request = require('request-promise')
+const { Subscriber } = require('zeromq')
 const dotenv = require('dotenv')
 
 dotenv.config()
@@ -14,23 +13,13 @@ const mongoose = require('mongoose')
 
 const connectToDb = () => {
   console.log('initiating db connection...')
-  mongoose
-    .connect(process.env.MONGO_URL, {
-      useNewUrlParser: true,
-      useFindAndModify: false,
-      useUnifiedTopology: true,
-    })
+  return mongoose
+    .connect(process.env.MONGO_URL)
     .catch((e) => {
       console.error(`error on initial db connection: ${e.message}`)
-      setTimeout(connectToDb, 5000)
+      return new Promise((resolve) => setTimeout(() => resolve(connectToDb()), 5000))
     })
 }
-connectToDb()
-
-mongoose.connection.once('open', async () => {
-  console.log('connected to mongodb successfully')
-  await listen()
-})
 
 const sendAlert = async ({
   alertId,
@@ -70,10 +59,11 @@ const sendAlert = async ({
 
   try {
     if (!process.env.DISABLE_WEBHOOKS) {
-      await request({
-        uri: webhookUrl,
-        method: 'post',
-        json: {
+      const res = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({
           username: 'ED Alerts',
           avatar_url: `${process.env.SITE_URL}/favicon.png`,
           content: discordUser ? `<@${discordUser}>` : undefined,
@@ -89,9 +79,7 @@ const sendAlert = async ({
               fields: [
                 {
                   name: 'Location',
-                  value: `${station}, ${system} ${
-                    planetary ? '(planetary)' : ''
-                  }`,
+                  value: `${station}, ${system} ${planetary ? '(planetary)' : ''}`,
                   inline: false,
                 },
                 {
@@ -135,8 +123,20 @@ const sendAlert = async ({
               },
             },
           ],
-        },
+        }),
       })
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        const message = body?.message || `HTTP ${res.status}`
+        if (message === 'Unknown Webhook') {
+          await Alert.deleteOne({ _id: alertId })
+          console.log(`deleted alert ${alertId} due to removed webhook`)
+        } else {
+          console.error(`webhook failed for alert ${alertId}: ${message}`)
+        }
+        return
+      }
 
       const newTrigger = new Trigger({
         alert: alertId,
@@ -147,40 +147,31 @@ const sendAlert = async ({
       console.log(`sent alert ${alertId} successfully`)
     }
   } catch (e) {
-    if (e && e.message) {
-      const {
-        error: { message },
-      } = e
-
-      if (message === 'Unknown Webhook') {
-        await Alert.deleteOne({ _id: alertId })
-        console.log(`deleted alert ${alertId} due to removed webhook`)
-      } else {
-        console.error(`webhook failed for alert ${alertId}: ${message}`)
-      }
-    } else {
-      console.error(`webhook failed for alert ${alertId}: unknown error`)
-    }
+    console.error(`webhook failed for alert ${alertId}: ${e.message}`)
   }
 }
 
 const listen = async () => {
-  const sock = zmq.socket('sub')
+  const sock = new Subscriber()
   sock.connect('tcp://eddn.edcd.io:9500')
   sock.subscribe('')
 
   console.log('zmq connected to tcp://eddn.edcd.io:9500')
 
-  sock.on('message', async (topic) => {
-    const inflated = JSON.parse(zlib.inflateSync(topic))
-    if (inflated['$schemaRef'] === 'https://eddn.edcd.io/schemas/commodity/3') {
+  for await (const [msg] of sock) {
+    try {
+      const inflated = JSON.parse(zlib.inflateSync(msg))
+      if (inflated['$schemaRef'] !== 'https://eddn.edcd.io/schemas/commodity/3') {
+        continue
+      }
+
       console.log(inflated.message.timestamp, 'eddn commodity message received')
 
       const fleetCarrier = /^[a-z0-9]{3}-[a-z0-9]{3}$/i.test(
         inflated.message.stationName
       )
 
-      let station = stations.find(
+      const station = stations.find(
         (st) =>
           st.name === inflated.message.stationName &&
           (st.system_name && !fleetCarrier
@@ -206,137 +197,149 @@ const listen = async () => {
           const alerts = await Alert.find({
             commodity: commodity.name,
           }).maxTimeMS(2000)
-          if (alerts.length > 0)
-            for (const alert of alerts) {
+
+          if (alerts.length === 0) continue
+
+          for (const alert of alerts) {
+            if (
+              alert.freq === 0 ||
+              (alert.freq > 0 && Date.now() > alert.lastSent + alert.freq)
+            ) {
               if (
-                alert.freq === 0 ||
-                (alert.freq > 0 && Date.now() > alert.lastSent + alert.freq)
+                alert.pad === 'any' ||
+                (alert.pad === 'l' && maxPadSize === 'L') ||
+                maxPadSize === 'unknown'
               ) {
                 if (
-                  alert.pad === 'any' ||
-                  (alert.pad === 'l' && maxPadSize === 'L') ||
-                  maxPadSize === 'unknown'
+                  ((planetary && alert.includePlanetary) || !planetary) &&
+                  ((fleetCarrier && alert.includeFleetCarrier) || !fleetCarrier)
                 ) {
                   if (
-                    ((planetary && alert.includePlanetary) || !planetary) &&
-                    ((fleetCarrier && alert.includeFleetCarrier) ||
-                      !fleetCarrier)
+                    alert.type === 'buy' &&
+                    commodity.buyPrice !== 0 &&
+                    commodity.stock > alert.minSupply
                   ) {
                     if (
-                      alert.type === 'buy' &&
-                      commodity.buyPrice !== 0 &&
-                      commodity.stock > alert.minSupply
+                      alert.trigger === 'above' &&
+                      commodity.buyPrice > alert.value
                     ) {
-                      if (
-                        alert.trigger === 'above' &&
-                        commodity.buyPrice > alert.value
-                      ) {
-                        await sendAlert({
-                          alertId: alert._id,
-                          alertValue: alert.value,
-                          commodityName: commodity.name,
-                          type: 'buy',
-                          trigger: 'above',
-                          value: commodity.buyPrice,
-                          station: inflated.message.stationName,
-                          system: inflated.message.systemName,
-                          demand: commodity.demand,
-                          supply: commodity.stock,
-                          maxPadSize,
-                          stationType,
-                          distance,
-                          planetary,
-                          webhookUrl: alert.webhook,
-                          discordUser: alert.discordUser,
-                          freq: alert.freq,
-                        })
-                      } else if (
-                        alert.trigger === 'below' &&
-                        commodity.buyPrice < alert.value
-                      ) {
-                        await sendAlert({
-                          alertId: alert._id,
-                          alertValue: alert.value,
-                          commodityName: commodity.name,
-                          type: 'buy',
-                          trigger: 'below',
-                          value: commodity.buyPrice,
-                          station: inflated.message.stationName,
-                          system: inflated.message.systemName,
-                          demand: commodity.demand,
-                          supply: commodity.stock,
-                          maxPadSize,
-                          stationType,
-                          distance,
-                          planetary,
-                          webhookUrl: alert.webhook,
-                          discordUser: alert.discordUser,
-                          freq: alert.freq,
-                        })
-                      }
+                      await sendAlert({
+                        alertId: alert._id,
+                        alertValue: alert.value,
+                        commodityName: commodity.name,
+                        type: 'buy',
+                        trigger: 'above',
+                        value: commodity.buyPrice,
+                        station: inflated.message.stationName,
+                        system: inflated.message.systemName,
+                        demand: commodity.demand,
+                        supply: commodity.stock,
+                        maxPadSize,
+                        stationType,
+                        distance,
+                        planetary,
+                        webhookUrl: alert.webhook,
+                        discordUser: alert.discordUser,
+                        freq: alert.freq,
+                      })
                     } else if (
-                      alert.type === 'sell' &&
-                      commodity.sellPrice !== 0 &&
-                      commodity.demand > alert.minDemand
+                      alert.trigger === 'below' &&
+                      commodity.buyPrice < alert.value
                     ) {
-                      if (
-                        alert.trigger === 'above' &&
-                        commodity.sellPrice > alert.value
-                      ) {
-                        await sendAlert({
-                          alertId: alert._id,
-                          alertValue: alert.value,
-                          commodityName: commodity.name,
-                          type: 'sell',
-                          trigger: 'above',
-                          value: commodity.sellPrice,
-                          station: inflated.message.stationName,
-                          system: inflated.message.systemName,
-                          demand: commodity.demand,
-                          supply: commodity.stock,
-                          maxPadSize,
-                          stationType,
-                          distance,
-                          planetary,
-                          webhookUrl: alert.webhook,
-                          discordUser: alert.discordUser,
-                          freq: alert.freq,
-                        })
-                      } else if (
-                        alert.trigger === 'below' &&
-                        commodity.sellPrice < alert.value
-                      ) {
-                        await sendAlert({
-                          alertId: alert._id,
-                          alertValue: alert.value,
-                          commodityName: commodity.name,
-                          type: 'sell',
-                          trigger: 'below',
-                          value: commodity.sellPrice,
-                          station: inflated.message.stationName,
-                          system: inflated.message.systemName,
-                          demand: commodity.demand,
-                          supply: commodity.stock,
-                          maxPadSize,
-                          stationType,
-                          distance,
-                          planetary,
-                          webhookUrl: alert.webhook,
-                          discordUser: alert.discordUser,
-                          freq: alert.freq,
-                        })
-                      }
+                      await sendAlert({
+                        alertId: alert._id,
+                        alertValue: alert.value,
+                        commodityName: commodity.name,
+                        type: 'buy',
+                        trigger: 'below',
+                        value: commodity.buyPrice,
+                        station: inflated.message.stationName,
+                        system: inflated.message.systemName,
+                        demand: commodity.demand,
+                        supply: commodity.stock,
+                        maxPadSize,
+                        stationType,
+                        distance,
+                        planetary,
+                        webhookUrl: alert.webhook,
+                        discordUser: alert.discordUser,
+                        freq: alert.freq,
+                      })
+                    }
+                  } else if (
+                    alert.type === 'sell' &&
+                    commodity.sellPrice !== 0 &&
+                    commodity.demand > alert.minDemand
+                  ) {
+                    if (
+                      alert.trigger === 'above' &&
+                      commodity.sellPrice > alert.value
+                    ) {
+                      await sendAlert({
+                        alertId: alert._id,
+                        alertValue: alert.value,
+                        commodityName: commodity.name,
+                        type: 'sell',
+                        trigger: 'above',
+                        value: commodity.sellPrice,
+                        station: inflated.message.stationName,
+                        system: inflated.message.systemName,
+                        demand: commodity.demand,
+                        supply: commodity.stock,
+                        maxPadSize,
+                        stationType,
+                        distance,
+                        planetary,
+                        webhookUrl: alert.webhook,
+                        discordUser: alert.discordUser,
+                        freq: alert.freq,
+                      })
+                    } else if (
+                      alert.trigger === 'below' &&
+                      commodity.sellPrice < alert.value
+                    ) {
+                      await sendAlert({
+                        alertId: alert._id,
+                        alertValue: alert.value,
+                        commodityName: commodity.name,
+                        type: 'sell',
+                        trigger: 'below',
+                        value: commodity.sellPrice,
+                        station: inflated.message.stationName,
+                        system: inflated.message.systemName,
+                        demand: commodity.demand,
+                        supply: commodity.stock,
+                        maxPadSize,
+                        stationType,
+                        distance,
+                        planetary,
+                        webhookUrl: alert.webhook,
+                        discordUser: alert.discordUser,
+                        freq: alert.freq,
+                      })
                     }
                   }
                 }
               }
             }
+          }
         } catch (e) {
-          if (e && e.message)
-            console.error(`error handling alert: ${e.message}`)
-          else console.error('error handling alert: unknown')
+          console.error(`error handling commodity ${commodity.name}: ${e.message}`)
         }
       }
+    } catch (e) {
+      console.error(`error processing eddn message: ${e.message}`)
     }
-  })
+  }
 }
+
+const main = async () => {
+  await connectToDb()
+  console.log('connected to mongodb successfully')
+  await listen()
+}
+
+main().catch((e) => {
+  console.error('fatal error in listener:', e.message)
+  process.exit(1)
+})

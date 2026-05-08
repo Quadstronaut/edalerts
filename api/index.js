@@ -15,11 +15,7 @@ const triggerRoutes = require('./routes/triggers')
 const connectToDb = () => {
   console.log('initiating db connection...')
   mongoose
-    .connect(process.env.MONGO_URL, {
-      useNewUrlParser: true,
-      useFindAndModify: false,
-      useUnifiedTopology: true,
-    })
+    .connect(process.env.MONGO_URL)
     .catch((e) => {
       console.error(`error on initial db connection: ${e.message}`)
       setTimeout(connectToDb, 5000)
