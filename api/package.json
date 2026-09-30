@@ -8,14 +8,14 @@
     "listen": "node listen.js"
   },
   "dependencies": {
-    "body-parser": "^1.20.2",
+    "body-parser": "^1.20.6",
     "chalk": "^4.1.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "memoizee": "^0.4.17",
     "mongoose": "^8.4.0",
-    "morgan": "^1.10.0",
+    "morgan": "^1.12.1",
     "ws": "^8.17.1",
     "zeromq": "^6.0.0-beta.17"
   },
